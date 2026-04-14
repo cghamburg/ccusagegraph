@@ -14,8 +14,8 @@ Displays daily token usage and API costs as stacked bar charts, broken down by p
 
 ```bash
 # Clone the repo
-git clone https://github.com/cgohse/cc-usage-graph.git
-cd cc-usage-graph
+git clone https://github.com/cghamburg/ccusagegraph.git
+cd ccusagegraph
 
 # Make it available on your PATH
 ln -s "$(pwd)/ccusagegraph" /usr/local/bin/ccusagegraph
