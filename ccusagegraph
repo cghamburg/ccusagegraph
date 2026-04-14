@@ -32,7 +32,7 @@ SINCE=""
 UNTIL=""
 DAYS=""
 METRIC="tokens"
-TOP_N=8
+TOP_N=15
 FILTER=""
 LIST_PROJECTS=false
 COLOR_CODES="36:32:33:35:34:31:96:93:95:91"
@@ -91,7 +91,15 @@ done
 [[ -n "$UNTIL" && ! "$UNTIL" =~ ^[0-9]{8}$ ]] && { echo "Error: --until must be YYYYMMDD format" >&2; exit 1; }
 [[ ! "$TOP_N" =~ ^[1-9][0-9]*$ ]] && { echo "Error: --top must be a positive integer (>0)" >&2; exit 1; }
 
-TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
+if [[ -n "${COLUMNS:-}" ]]; then
+  TERM_WIDTH=$COLUMNS
+elif _w=$(stty size </dev/tty 2>/dev/null | awk '{print $2}') && [[ "$_w" =~ ^[0-9]+$ && "$_w" -gt 0 ]]; then
+  TERM_WIDTH=$_w
+elif _w=$(tput cols 2>/dev/null) && [[ "$_w" =~ ^[0-9]+$ && "$_w" -gt 0 ]]; then
+  TERM_WIDTH=$_w
+else
+  TERM_WIDTH=80
+fi
 
 # Resolve time range
 if [[ -n "$DAYS" ]]; then
@@ -284,11 +292,20 @@ TSV_OUTPUT=$(echo "$FLAT_DATA" | jq -r --argjson selected "$SELECTED_PROJECTS" -
   [$date] + [$cols[] | "\(.t):\(.c)"] + (if $other then ["\($other.t):\($other.c)"] else [] end) |
   join("\t")')
 
-# Build legend names
-LEGEND_NAMES=$(echo "$FLAT_DATA" | jq -r --argjson selected "$SELECTED_PROJECTS" --argjson show_other "$SHOW_OTHER" '
+# Build legend names with percentage
+LEGEND_NAMES=$(echo "$FLAT_DATA" | jq -r --arg metric "$METRIC" --argjson selected "$SELECTED_PROJECTS" --argjson show_other "$SHOW_OTHER" '
   . as $all |
-  ($selected[] | . as $p | [$all[] | select(.proj == $p)] | .[0].short // "?"),
-  (if $show_other then "other" else empty end)')
+  (if $metric == "cost" then map(.cost) else map(.tokens) end | add // 0) as $grand_total |
+  [
+    ($selected[] | . as $p |
+      [$all[] | select(.proj == $p)] |
+      { name: (.[0].short // "?"), val: (if $metric == "cost" then map(.cost) else map(.tokens) end | add // 0) }
+    ),
+    (if $show_other then
+      { name: "other", val: ([$all[] | select(.proj as $p | $selected | index($p) | not)] | if $metric == "cost" then map(.cost) else map(.tokens) end | add // 0) }
+    else empty end)
+  ] |
+  .[] | "\(.name) (\(if $grand_total > 0 then (.val / $grand_total * 100 | round) else 0 end)%)"')
 
 if [[ -z "$TSV_OUTPUT" ]]; then
   echo "  No data found for the given filters."
@@ -355,7 +372,7 @@ echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" 
     printf "  %-16s %8s %8s  %s\n", "Date", "Tokens", "Cost $", "Stacked"
     # Build dynamic separator for bar column
     bar_sep = ""
-    for (s = 0; s < bar_width && s < 60; s++) bar_sep = bar_sep "─"
+    for (s = 0; s < bar_width; s++) bar_sep = bar_sep "─"
     printf "  %-16s %8s %8s  %s\n", "────────────────", "────────", "────────", bar_sep
     for (i = 1; i <= n; i++) {
       total_val = totals[i]
@@ -414,13 +431,23 @@ echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" 
   }'
 
 # ── Legend ──
-echo "$LEGEND_NAMES" | awk -v colors="$COLOR_CODES" '
+echo "$LEGEND_NAMES" | awk -v colors="$COLOR_CODES" -v term_width="$TERM_WIDTH" '
 BEGIN {
   num_colors = split(colors, cc, ":")
-  printf "\n  Legend: "
+  prefix = "  Legend: "
+  indent = "          "
+  printf "\n%s", prefix
+  col = length(prefix)
 }
 {
   cidx = ((NR - 1) % num_colors) + 1
+  # entry width: 2(block) + 1(space) + name + 2(gap)
+  entry_len = 2 + 1 + length($0) + 2
+  if (col + entry_len > term_width && col > length(prefix)) {
+    printf "\n%s", indent
+    col = length(indent)
+  }
   printf "\033[%sm██\033[0m %s  ", cc[cidx], $0
+  col += entry_len
 }
 END { printf "\n\n" }'
