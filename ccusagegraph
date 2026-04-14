@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1"
+
+# Require Bash 4+ for associative arrays
+(( BASH_VERSINFO[0] >= 4 )) || { echo "Error: Bash 4+ required (found ${BASH_VERSION})" >&2; exit 1; }
+
+# Check required tools
+command -v ccusage >/dev/null 2>&1 || { echo "Error: ccusage not found. Install from https://github.com/ryoppippi/ccusage" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "Error: jq not found. Install from https://jqlang.github.io/jq/" >&2; exit 1; }
+
+# Platform detection (cached)
+IS_DARWIN=false
+[[ "$(uname)" == "Darwin" ]] && IS_DARWIN=true
+
+# Date helpers — encapsulate macOS vs Linux date differences
+date_subtract_days() { # $1=days → YYYYMMDD
+  if $IS_DARWIN; then date -v-"${1}d" +%Y%m%d
+  else date -d "${1} days ago" +%Y%m%d; fi
+}
+date_format() { # $1=YYYYMMDD → YYYY-MM-DD
+  if $IS_DARWIN; then date -j -f "%Y%m%d" "$1" +%Y-%m-%d
+  else date -d "$1" +%Y-%m-%d; fi
+}
+date_add_one_day() { # $1=YYYYMMDD → YYYYMMDD+1
+  if $IS_DARWIN; then date -j -v+1d -f "%Y%m%d" "$1" +%Y%m%d
+  else date -d "$1 + 1 day" +%Y%m%d; fi
+}
+
+SINCE=""
+UNTIL=""
+DAYS=""
+METRIC="tokens"
+TOP_N=8
+FILTER=""
+LIST_PROJECTS=false
+COLOR_CODES="36:32:33:35:34:31:96:93:95:91"
+
+usage() {
+  cat <<'HELP'
+Usage: ccusagegraph [OPTIONS]
+
+Time range:
+  -s, --since YYYYMMDD   Start date
+  -u, --until YYYYMMDD   End date
+  -d, --days N           Last N days (e.g. -d 30)
+                         Default: 28 days (4 weeks)
+
+Display:
+  -c, --cost             Size bars by cost instead of tokens
+  -n, --top N            Show top N projects in stacked view (default: 8)
+
+Projects:
+  -l, --list             List all projects in time range with costs
+  -p, --project NAMES    Filter by project short name (comma-separated)
+                         Use -l to see available short names
+                         e.g. -p aia,tracker,shmups
+
+  -v, --version          Show version
+      --help             Show this help
+
+Examples:
+  ccusagegraph                        # last 28 days, stacked by project
+  ccusagegraph -d 30 -c               # last 30 days, by cost
+  ccusagegraph -l                     # list all projects
+  ccusagegraph -p aia,tracker         # only aia and tracker projects
+  ccusagegraph -d 30 -p aia -c       # aia project, last 30 days, by cost
+HELP
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--since) [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; SINCE="$2"; shift 2 ;;
+    -u|--until) [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; UNTIL="$2"; shift 2 ;;
+    -d|--days)  [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; DAYS="$2"; shift 2 ;;
+    -c|--cost) METRIC="cost"; shift ;;
+    -n|--top)  [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; TOP_N="$2"; shift 2 ;;
+    -p|--project) [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; FILTER="$2"; shift 2 ;;
+    -l|--list) LIST_PROJECTS=true; shift ;;
+    -v|--version) echo "ccusagegraph $VERSION"; exit 0 ;;
+    --help) usage ;;
+    *) echo "Error: Unknown option: $1" >&2; exit 1 ;;
+  esac
+done
+
+# Validate inputs
+[[ -n "$DAYS" && ! "$DAYS" =~ ^[1-9][0-9]*$ ]] && { echo "Error: --days must be a positive integer (>0)" >&2; exit 1; }
+[[ -n "$SINCE" && ! "$SINCE" =~ ^[0-9]{8}$ ]] && { echo "Error: --since must be YYYYMMDD format" >&2; exit 1; }
+[[ -n "$UNTIL" && ! "$UNTIL" =~ ^[0-9]{8}$ ]] && { echo "Error: --until must be YYYYMMDD format" >&2; exit 1; }
+[[ ! "$TOP_N" =~ ^[1-9][0-9]*$ ]] && { echo "Error: --top must be a positive integer (>0)" >&2; exit 1; }
+
+TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
+
+# Resolve time range
+if [[ -n "$DAYS" ]]; then
+  SINCE=$(date_subtract_days "$DAYS")
+elif [[ -z "$SINCE" ]]; then
+  SINCE=$(date_subtract_days 28)
+fi
+
+CCUSAGE_ARGS=(daily --since "$SINCE" --instances --json)
+[[ -n "$UNTIL" ]] && CCUSAGE_ARGS+=(--until "$UNTIL")
+
+if ! JSON=$(ccusage "${CCUSAGE_ARGS[@]}" 2>&1); then
+  echo "Error: ccusage failed: $JSON" >&2
+  exit 1
+fi
+
+# Resolve project key to meaningful directory name via filesystem.
+# ccusage keys are absolute paths with '/' replaced by '-', e.g. "-Users-chris-ai-apps-myproject".
+# This function greedily matches the longest hyphen-joined segments against actual directories.
+resolve_project_name() {
+  local key="${1#-}"
+  if [[ -z "$key" ]]; then echo "unknown"; return; fi
+
+  IFS='-' read -r -a parts <<< "$key"
+  local current="/"
+  local resolved_parts=()
+  local i=0 j=0 k=0
+  local n=${#parts[@]}
+
+  while (( i < n )); do
+    local try="${parts[$i]}"
+    local found=false
+    local best_j=$i best_dir="$try" best_path=""
+
+    j=$i
+    while (( j < n )); do
+      local test_path="${current%/}/$try"
+      if [[ -d "$test_path" ]]; then
+        best_j=$j; best_dir="$try"; best_path="$test_path"; found=true
+      fi
+      j=$((j + 1))
+      (( j < n )) && try="$try-${parts[$j]}"
+    done
+    # Test the final accumulated try (handles case when all remaining segments form one directory)
+    test_path="${current%/}/$try"
+    if [[ -d "$test_path" ]]; then
+      best_j=$((n - 1)); best_dir="$try"; best_path="$test_path"; found=true
+    fi
+
+    if $found; then
+      current="$best_path"
+      resolved_parts+=("$best_dir")
+      i=$((best_j + 1))
+    else
+      local remaining=""
+      for (( k=i; k<n; k++ )); do
+        [[ -n "$remaining" ]] && remaining="$remaining-"
+        remaining="$remaining${parts[$k]}"
+      done
+      [[ -n "$remaining" ]] && resolved_parts+=("$remaining")
+      break
+    fi
+  done
+
+  # Strip Users/username prefix, then skip organizational dirs if more segments follow
+  local rn=${#resolved_parts[@]}
+  local skip=0
+  [[ "${resolved_parts[0]}" == "Users" ]] && skip=2
+  local idx=$skip
+  local org_dirs=(ai apps games instances privat .claude comfyui code dev-local devops gitlab-backup)
+
+  while (( idx < rn )); do
+    local seg="${resolved_parts[$idx]}" is_org=false
+    for od in "${org_dirs[@]}"; do [[ "$seg" == "$od" ]] && is_org=true && break; done
+    if $is_org && (( idx < rn - 1 )); then
+      idx=$((idx + 1))
+    else
+      break
+    fi
+  done
+
+  local result=""
+  while (( idx < rn )); do
+    [[ -n "$result" ]] && result="$result/"
+    result="$result${resolved_parts[$idx]}"
+    idx=$((idx + 1))
+  done
+  [[ -z "$result" ]] && result="${resolved_parts[$((rn - 1))]}"
+  # Deduplicate repeated path segments: a/a → a
+  while [[ "$result" == */* ]]; do
+    local prefix="${result%%/*}"
+    local suffix="${result#*/}"
+    local first_seg="${suffix%%/*}"
+    if [[ "$prefix" == "$first_seg" ]]; then
+      result="$suffix"
+    else
+      break
+    fi
+  done
+  # Deduplicate repeated dash-joined halves: travel-basket-travel-basket → travel-basket
+  local len=${#result}
+  if (( len % 2 == 1 )); then
+    local half=$(( len / 2 ))
+    if [[ "${result:0:half}" == "${result:half+1}" && "${result:half:1}" == "-" ]]; then
+      result="${result:0:half}"
+    fi
+  fi
+  echo "$result"
+}
+
+# Build JSON mapping of project keys to resolved names (single pass)
+PROJECT_KEYS=$(echo "$JSON" | jq -r '.projects | keys[]')
+NAME_MAP_JSON=""
+while IFS= read -r pkey; do
+  [[ -z "$pkey" ]] && continue
+  resolved=$(resolve_project_name "$pkey")
+  # Escape quotes in key/value for JSON safety
+  pkey_escaped="${pkey//\\/\\\\}"
+  pkey_escaped="${pkey_escaped//\"/\\\"}"
+  resolved_escaped="${resolved//\\/\\\\}"
+  resolved_escaped="${resolved_escaped//\"/\\\"}"
+  [[ -n "$NAME_MAP_JSON" ]] && NAME_MAP_JSON+=","
+  NAME_MAP_JSON+="\"$pkey_escaped\":\"$resolved_escaped\""
+done <<< "$PROJECT_KEYS"
+NAME_MAP="{${NAME_MAP_JSON}}"
+
+# Precompute: for each project, compute resolved name + totals
+PROJECT_SUMMARY=$(echo "$JSON" | jq -r --argjson names "$NAME_MAP" '
+  [.projects | to_entries[] | {
+    key: .key,
+    short: ($names[.key] // .key),
+    cost: ([.value[].totalCost] | add // 0),
+    tokens: ([.value[].totalTokens] | add // 0),
+    days: (.value | length)
+  }] | sort_by(-.cost)')
+
+# ── List mode ──
+if [[ "$LIST_PROJECTS" == true ]]; then
+  echo "$PROJECT_SUMMARY" | jq -r '.[] | "\(.cost)\t\(.tokens)\t\(.days)\t\(.short)\t\(.key)"' | awk -F'\t' '
+  BEGIN {
+    printf "\n  \033[1mProjects in time range\033[0m\n\n"
+    printf "  %8s  %10s  %4s  %-20s  %s\n", "Cost $", "Tokens", "Days", "Short Name", "Full Path"
+    printf "  %8s  %10s  %4s  %-20s  %s\n", "────────", "──────────", "────", "────────────────────", "─────────────────────────────────"
+  }
+  {
+    printf "  %8.2f  %9.1fM  %4d  %-20s  %s\n", $1, $2/1000000, $3, $4, $5
+  }
+  END { printf "\n" }'
+  exit 0
+fi
+
+# ── Build per-project daily data, then produce TSV ──
+# Step 1: Flatten all project/date/cost/token data
+FLAT_DATA=$(echo "$JSON" | jq -r --argjson names "$NAME_MAP" '
+  [.projects | to_entries[] | .key as $proj | ($names[$proj] // $proj) as $short |
+    .value[] | {proj: $proj, short: $short, date: .date, tokens: .totalTokens, cost: .totalCost}
+  ]')
+
+# Step 2: Determine which projects to show
+if [[ -n "$FILTER" ]]; then
+  # Filter mode: show only matching projects (exact short-name match, case-insensitive)
+  SELECTED_PROJECTS=$(echo "$FLAT_DATA" | jq -r --arg filter "$FILTER" '
+    ($filter | split(",") | map(ascii_downcase)) as $names |
+    [.[] | select(.short | ascii_downcase | . as $s | $names | any(. == $s))] |
+    group_by(.proj) | map({proj: .[0].proj, short: .[0].short, total: (map(.cost) | add)}) |
+    sort_by(-.total) | map(.proj)')
+else
+  # Top-N mode
+  SELECTED_PROJECTS=$(echo "$FLAT_DATA" | jq -r --argjson n "$TOP_N" '
+    group_by(.proj) | map({proj: .[0].proj, short: .[0].short, total: (map(.cost) | add)}) |
+    sort_by(-.total) | .[:$n] | map(.proj)')
+fi
+
+# Step 3: Build TSV — one row per date, one column per selected project (+ "other" if unfiltered)
+SHOW_OTHER="false"
+[[ -z "$FILTER" ]] && SHOW_OTHER="true"
+
+TSV_OUTPUT=$(echo "$FLAT_DATA" | jq -r --argjson selected "$SELECTED_PROJECTS" --argjson show_other "$SHOW_OTHER" '
+  . as $all |
+  [.[].date] | unique | sort | . as $dates |
+  $dates[] | . as $date |
+  [$selected[] | . as $p |
+    [$all[] | select(.date == $date and .proj == $p)] |
+    {t: (map(.tokens) | add // 0), c: (map(.cost) | add // 0)}
+  ] as $cols |
+  (if $show_other then
+    [$all[] | select(.date == $date and (.proj as $p | $selected | index($p) | not))] |
+    {t: (map(.tokens) | add // 0), c: (map(.cost) | add // 0)}
+  else null end) as $other |
+  [$date] + [$cols[] | "\(.t):\(.c)"] + (if $other then ["\($other.t):\($other.c)"] else [] end) |
+  join("\t")')
+
+# Build legend names
+LEGEND_NAMES=$(echo "$FLAT_DATA" | jq -r --argjson selected "$SELECTED_PROJECTS" --argjson show_other "$SHOW_OTHER" '
+  . as $all |
+  ($selected[] | . as $p | [$all[] | select(.proj == $p)] | .[0].short // "?"),
+  (if $show_other then "other" else empty end)')
+
+if [[ -z "$TSV_OUTPUT" ]]; then
+  echo "  No data found for the given filters."
+  exit 0
+fi
+
+# ── Fill missing dates with empty rows ──
+END_DATE="${UNTIL:-$(date +%Y%m%d)}"
+declare -A EXISTING_DATES
+while IFS= read -r line; do
+  d="${line%%$'\t'*}"
+  EXISTING_DATES["$d"]="$line"
+done <<< "$TSV_OUTPUT"
+
+FIRST_LINE="${TSV_OUTPUT%%$'\n'*}"
+NUM_COLS=$(echo "$FIRST_LINE" | awk -F'\t' '{print NF - 1}')
+EMPTY_COLS=""
+for ((i=0; i<NUM_COLS; i++)); do
+  EMPTY_COLS+=$'\t'"0:0"
+done
+
+FILLED_TSV=""
+current="$SINCE"
+while [[ "$current" < "$END_DATE" || "$current" == "$END_DATE" ]]; do
+  date_fmt=$(date_format "$current")
+  if [[ -n "${EXISTING_DATES[$date_fmt]+x}" ]]; then
+    FILLED_TSV+="${EXISTING_DATES[$date_fmt]}"$'\n'
+  else
+    FILLED_TSV+="${date_fmt}${EMPTY_COLS}"$'\n'
+  fi
+  current=$(date_add_one_day "$current")
+done
+TSV_OUTPUT="${FILLED_TSV%$'\n'}"
+
+# ── Horizontal stacked bars ──
+echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" -v colors="$COLOR_CODES" '
+  BEGIN {
+    num_colors = split(colors, color_codes, ":")
+    max = 0
+  }
+  {
+    dates[NR] = $1
+    day_total = 0
+    ncols = NF - 1
+    for (c = 1; c <= ncols; c++) {
+      split($(c+1), parts, ":")
+      key = NR SUBSEP c
+      tok[key] = parts[1] + 0
+      cst[key] = parts[2] + 0
+      day_total += (metric == "cost") ? cst[key] : tok[key]
+    }
+    totals[NR] = day_total
+    if (day_total > max) max = day_total
+    n = NR
+    NC = ncols
+  }
+  END {
+    # Fixed columns: 2(indent) + 16(date) + 1 + 8(tokens) + 1 + 8(cost) + 2 = 38
+    fixed = 38
+    bar_width = term_width - fixed
+    if (bar_width < 10) bar_width = 10
+    split("Sun:Mon:Tue:Wed:Thu:Fri:Sat", day_names, ":")
+    printf "\n  \033[1mClaude Code Usage — Stacked by Project\033[0m\n\n"
+    printf "  %-16s %8s %8s  %s\n", "Date", "Tokens", "Cost $", "Stacked"
+    # Build dynamic separator for bar column
+    bar_sep = ""
+    for (s = 0; s < bar_width && s < 60; s++) bar_sep = bar_sep "─"
+    printf "  %-16s %8s %8s  %s\n", "────────────────", "────────", "────────", bar_sep
+    for (i = 1; i <= n; i++) {
+      total_val = totals[i]
+      total_bar_len = (max > 0) ? int(total_val / max * bar_width) : 0
+      if (total_bar_len < 1 && total_val > 0) total_bar_len = 1
+
+      bar = ""
+      chars_placed = 0
+      last_cidx = 1
+      for (c = 1; c <= NC; c++) {
+        key = i SUBSEP c
+        seg_val = (metric == "cost") ? cst[key] : tok[key]
+        if (total_val > 0)
+          seg_len = int(seg_val / total_val * total_bar_len + 0.5)
+        else
+          seg_len = 0
+        if (chars_placed + seg_len > total_bar_len)
+          seg_len = total_bar_len - chars_placed
+        if (seg_len > 0) {
+          last_cidx = ((c - 1) % num_colors) + 1
+          bar = bar sprintf("\033[%sm", color_codes[last_cidx])
+          for (j = 0; j < seg_len; j++) bar = bar "█"
+          bar = bar "\033[0m"
+          chars_placed += seg_len
+        }
+      }
+      # Fill rounding remainder with last used color
+      if (chars_placed < total_bar_len) {
+        bar = bar sprintf("\033[%sm", color_codes[last_cidx])
+        while (chars_placed < total_bar_len) { bar = bar "█"; chars_placed++ }
+        bar = bar "\033[0m"
+      }
+
+      # Day of week via Tomohiko Sakamoto algorithm (0=Sun..6=Sat)
+      split(dates[i], dp, "-")
+      y = dp[1]+0; m = dp[2]+0; d = dp[3]+0
+      split("0:3:2:5:0:3:5:1:4:6:2:4", t_arr, ":")
+      if (m < 3) y--
+      dow = (y + int(y/4) - int(y/100) + int(y/400) + t_arr[m]+0 + d) % 7
+      day_label = day_names[dow + 1]
+      date_str = sprintf("%s %s", dates[i], day_label)
+      is_weekend = (dow == 0 || dow == 6)
+
+      tok_sum = 0; cost_sum = 0
+      for (c = 1; c <= NC; c++) { key = i SUBSEP c; tok_sum += tok[key]; cost_sum += cst[key] }
+      if (is_weekend)
+        printf "  \033[2m%-16s %7.1fM %8.2f\033[0m  %s\n", date_str, tok_sum/1000000, cost_sum, bar
+      else
+        printf "  %-16s %7.1fM %8.2f  %s\n", date_str, tok_sum/1000000, cost_sum, bar
+    }
+    grand_t = 0; grand_c = 0
+    for (i = 1; i <= n; i++) {
+      for (c = 1; c <= NC; c++) { key = i SUBSEP c; grand_t += tok[key]; grand_c += cst[key] }
+    }
+    printf "\n  ── %d days (%s → %s) | %.1fM tokens | $%.2f ──\n", n, dates[1], dates[n], grand_t/1000000, grand_c
+  }'
+
+# ── Legend ──
+echo "$LEGEND_NAMES" | awk -v colors="$COLOR_CODES" '
+BEGIN {
+  num_colors = split(colors, cc, ":")
+  printf "\n  Legend: "
+}
+{
+  cidx = ((NR - 1) % num_colors) + 1
+  printf "\033[%sm██\033[0m %s  ", cc[cidx], $0
+}
+END { printf "\n\n" }'
