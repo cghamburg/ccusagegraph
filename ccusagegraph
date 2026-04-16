@@ -35,7 +35,8 @@ METRIC="tokens"
 TOP_N=15
 FILTER=""
 LIST_PROJECTS=false
-COLOR_CODES="36:32:33:35:34:31:96:93:95:91"
+COLOR_CODES="38;5;27:38;5;196:38;5;40:38;5;214:38;5;201:38;5;51:38;5;226:38;5;99:38;5;82:38;5;173"
+BAR_CHARS="█:▓:░:▒"
 
 usage() {
   cat <<'HELP'
@@ -341,9 +342,10 @@ done
 TSV_OUTPUT="${FILLED_TSV%$'\n'}"
 
 # ── Horizontal stacked bars ──
-echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" -v colors="$COLOR_CODES" '
+echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" -v colors="$COLOR_CODES" -v bar_chars="$BAR_CHARS" '
   BEGIN {
     num_colors = split(colors, color_codes, ":")
+    num_chars = split(bar_chars, bar_syms, ":")
     max = 0
   }
   {
@@ -363,8 +365,8 @@ echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" 
     NC = ncols
   }
   END {
-    # Fixed columns: 2(indent) + 16(date) + 1 + 8(tokens) + 1 + 8(cost) + 2 = 38
-    fixed = 38
+    # Fixed columns: 2(indent) + 16(date) + 1 + 8(tokens) + 1 + 8(cost) + 2 = 38, +1 right margin
+    fixed = 39
     bar_width = term_width - fixed
     if (bar_width < 10) bar_width = 10
     split("Sun:Mon:Tue:Wed:Thu:Fri:Sat", day_names, ":")
@@ -393,16 +395,17 @@ echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" 
           seg_len = total_bar_len - chars_placed
         if (seg_len > 0) {
           last_cidx = ((c - 1) % num_colors) + 1
+          char_idx = ((c - 1) % num_chars) + 1
           bar = bar sprintf("\033[%sm", color_codes[last_cidx])
-          for (j = 0; j < seg_len; j++) bar = bar "█"
+          for (j = 0; j < seg_len; j++) bar = bar bar_syms[char_idx]
           bar = bar "\033[0m"
           chars_placed += seg_len
         }
       }
-      # Fill rounding remainder with last used color
+      # Fill rounding remainder with last used color/char
       if (chars_placed < total_bar_len) {
         bar = bar sprintf("\033[%sm", color_codes[last_cidx])
-        while (chars_placed < total_bar_len) { bar = bar "█"; chars_placed++ }
+        while (chars_placed < total_bar_len) { bar = bar bar_syms[char_idx]; chars_placed++ }
         bar = bar "\033[0m"
       }
 
@@ -431,9 +434,10 @@ echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" 
   }'
 
 # ── Legend ──
-echo "$LEGEND_NAMES" | awk -v colors="$COLOR_CODES" -v term_width="$TERM_WIDTH" '
+echo "$LEGEND_NAMES" | awk -v colors="$COLOR_CODES" -v bar_chars="$BAR_CHARS" -v term_width="$TERM_WIDTH" '
 BEGIN {
   num_colors = split(colors, cc, ":")
+  num_chars = split(bar_chars, bc, ":")
   prefix = "  Legend: "
   indent = "          "
   printf "\n%s", prefix
@@ -441,13 +445,14 @@ BEGIN {
 }
 {
   cidx = ((NR - 1) % num_colors) + 1
+  char_idx = ((NR - 1) % num_chars) + 1
   # entry width: 2(block) + 1(space) + name + 2(gap)
   entry_len = 2 + 1 + length($0) + 2
   if (col + entry_len > term_width && col > length(prefix)) {
     printf "\n%s", indent
     col = length(indent)
   }
-  printf "\033[%sm██\033[0m %s  ", cc[cidx], $0
+  printf "\033[%sm%s%s\033[0m %s  ", cc[cidx], bc[char_idx], bc[char_idx], $0
   col += entry_len
 }
 END { printf "\n\n" }'
