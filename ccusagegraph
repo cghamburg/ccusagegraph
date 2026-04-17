@@ -31,10 +31,14 @@ date_add_one_day() { # $1=YYYYMMDD → YYYYMMDD+1
 SINCE=""
 UNTIL=""
 DAYS=""
-METRIC="tokens"
+METRIC="cost"
 TOP_N=15
 FILTER=""
 LIST_PROJECTS=false
+WEEKLY_LIMIT=1400
+PRO_WEEKLY=70
+MAX5_WEEKLY=350
+SHOW_LINES=true
 COLOR_CODES="38;5;27:38;5;196:38;5;40:38;5;214:38;5;201:38;5;51:38;5;226:38;5;99:38;5;82:38;5;173"
 BAR_CHARS="█:▓:░:▒"
 
@@ -49,8 +53,14 @@ Time range:
                          Default: 28 days (4 weeks)
 
 Display:
-  -c, --cost             Size bars by cost instead of tokens
+  -t, --tokens           Size bars by tokens instead of cost (default: cost)
   -n, --top N            Show top N projects in stacked view (default: 8)
+  -w, --weekly-limit N   Weekly $ limit driving the 7d-Eq% column and red
+                         threshold line. Default: 1400 (Max 20x plan).
+      --no-lines         Hide the three threshold lines in the bars.
+                         Lines shown by default (only in cost-mode):
+                         gray=Pro ($70/wk), yellow=Max 5x ($350/wk),
+                         red=Max 20x (-w value, default $1400/wk).
 
 Projects:
   -l, --list             List all projects in time range with costs
@@ -62,11 +72,11 @@ Projects:
       --help             Show this help
 
 Examples:
-  ccusagegraph                        # last 28 days, stacked by project
-  ccusagegraph -d 30 -c               # last 30 days, by cost
+  ccusagegraph                        # last 28 days, stacked by project (cost)
+  ccusagegraph -d 30 -t               # last 30 days, by tokens
   ccusagegraph -l                     # list all projects
   ccusagegraph -p aia,tracker         # only aia and tracker projects
-  ccusagegraph -d 30 -p aia -c       # aia project, last 30 days, by cost
+  ccusagegraph -d 30 -p aia           # aia project, last 30 days
 HELP
   exit 0
 }
@@ -76,8 +86,10 @@ while [[ $# -gt 0 ]]; do
     -s|--since) [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; SINCE="$2"; shift 2 ;;
     -u|--until) [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; UNTIL="$2"; shift 2 ;;
     -d|--days)  [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; DAYS="$2"; shift 2 ;;
-    -c|--cost) METRIC="cost"; shift ;;
+    -t|--tokens) METRIC="tokens"; shift ;;
     -n|--top)  [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; TOP_N="$2"; shift 2 ;;
+    -w|--weekly-limit) [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; WEEKLY_LIMIT="$2"; shift 2 ;;
+    --no-lines) SHOW_LINES=false; shift ;;
     -p|--project) [[ $# -lt 2 ]] && { echo "Error: $1 requires an argument" >&2; exit 1; }; FILTER="$2"; shift 2 ;;
     -l|--list) LIST_PROJECTS=true; shift ;;
     -v|--version) echo "ccusagegraph $VERSION"; exit 0 ;;
@@ -91,6 +103,7 @@ done
 [[ -n "$SINCE" && ! "$SINCE" =~ ^[0-9]{8}$ ]] && { echo "Error: --since must be YYYYMMDD format" >&2; exit 1; }
 [[ -n "$UNTIL" && ! "$UNTIL" =~ ^[0-9]{8}$ ]] && { echo "Error: --until must be YYYYMMDD format" >&2; exit 1; }
 [[ ! "$TOP_N" =~ ^[1-9][0-9]*$ ]] && { echo "Error: --top must be a positive integer (>0)" >&2; exit 1; }
+[[ ! "$WEEKLY_LIMIT" =~ ^[1-9][0-9]*$ ]] && { echo "Error: --weekly-limit must be a positive integer (>0)" >&2; exit 1; }
 
 if [[ -n "${COLUMNS:-}" ]]; then
   TERM_WIDTH=$COLUMNS
@@ -342,7 +355,7 @@ done
 TSV_OUTPUT="${FILLED_TSV%$'\n'}"
 
 # ── Horizontal stacked bars ──
-echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" -v colors="$COLOR_CODES" -v bar_chars="$BAR_CHARS" '
+echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" -v colors="$COLOR_CODES" -v bar_chars="$BAR_CHARS" -v weekly_limit="$WEEKLY_LIMIT" -v pro_weekly="$PRO_WEEKLY" -v max5_weekly="$MAX5_WEEKLY" -v show_lines="$SHOW_LINES" '
   BEGIN {
     num_colors = split(colors, color_codes, ":")
     num_chars = split(bar_chars, bar_syms, ":")
@@ -365,25 +378,50 @@ echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" 
     NC = ncols
   }
   END {
-    # Fixed columns: 2(indent) + 16(date) + 1 + 8(tokens) + 1 + 8(cost) + 2 = 38, +1 right margin
-    fixed = 39
+    # Fixed columns: 2(indent) + 16(date) + 1 + 8(tokens) + 1 + 8(cost) + 1 + 6(pct) + 2 = 45, +1 right margin
+    fixed = 46
     bar_width = term_width - fixed
     if (bar_width < 10) bar_width = 10
+
+    # 7d-plan-equivalent: the Max-20x daily limit drives the percentage column;
+    # Pro / Max-5x / Max-20x thresholds render as vertical lines in the bars.
+    daily_limit = weekly_limit / 7.0
+    pro_daily = pro_weekly / 7.0
+    max5_daily = max5_weekly / 7.0
+    scale_max = max
+    # Rescale so the rightmost (Max 20x) line is always on-screen in cost-mode.
+    if (metric == "cost" && daily_limit > scale_max) scale_max = daily_limit
+    draw_lines = (metric == "cost" && show_lines == "true" && scale_max > 0)
+    if (draw_lines) {
+      pro_pos   = int(pro_daily   / scale_max * bar_width + 0.5)
+      max5_pos  = int(max5_daily  / scale_max * bar_width + 0.5)
+      max20_pos = int(daily_limit / scale_max * bar_width + 0.5)
+      if (pro_pos   >= bar_width) pro_pos   = bar_width - 1
+      if (max5_pos  >= bar_width) max5_pos  = bar_width - 1
+      if (max20_pos >= bar_width) max20_pos = bar_width - 1
+    } else {
+      pro_pos = -1; max5_pos = -1; max20_pos = -1
+    }
+    furthest_line = max20_pos
+    if (max5_pos > furthest_line) furthest_line = max5_pos
+    if (pro_pos  > furthest_line) furthest_line = pro_pos
+
     split("Sun:Mon:Tue:Wed:Thu:Fri:Sat", day_names, ":")
     printf "\n  \033[1mClaude Code Usage — Stacked by Project\033[0m\n\n"
-    printf "  %-16s %8s %8s  %s\n", "Date", "Tokens", "Cost $", "Stacked"
-    # Build dynamic separator for bar column
+    printf "  %-16s %8s %8s %6s  %s\n", "Date", "Tokens", "Cost $", "7d-Eq%", "Stacked"
     bar_sep = ""
     for (s = 0; s < bar_width; s++) bar_sep = bar_sep "─"
-    printf "  %-16s %8s %8s  %s\n", "────────────────", "────────", "────────", bar_sep
+    printf "  %-16s %8s %8s %6s  %s\n", "────────────────", "────────", "────────", "──────", bar_sep
     for (i = 1; i <= n; i++) {
       total_val = totals[i]
-      total_bar_len = (max > 0) ? int(total_val / max * bar_width) : 0
+      total_bar_len = (scale_max > 0) ? int(total_val / scale_max * bar_width) : 0
       if (total_bar_len < 1 && total_val > 0) total_bar_len = 1
 
-      bar = ""
+      # Build bar as parallel arrays (vis_color[p], vis_char[p]) so we can
+      # overlay the red 100% line at an exact visible column.
       chars_placed = 0
       last_cidx = 1
+      last_char_idx = 1
       for (c = 1; c <= NC; c++) {
         key = i SUBSEP c
         seg_val = (metric == "cost") ? cst[key] : tok[key]
@@ -395,19 +433,45 @@ echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" 
           seg_len = total_bar_len - chars_placed
         if (seg_len > 0) {
           last_cidx = ((c - 1) % num_colors) + 1
-          char_idx = ((c - 1) % num_chars) + 1
-          bar = bar sprintf("\033[%sm", color_codes[last_cidx])
-          for (j = 0; j < seg_len; j++) bar = bar bar_syms[char_idx]
-          bar = bar "\033[0m"
-          chars_placed += seg_len
+          last_char_idx = ((c - 1) % num_chars) + 1
+          for (j = 0; j < seg_len; j++) {
+            vis_color[chars_placed] = color_codes[last_cidx]
+            vis_char[chars_placed] = bar_syms[last_char_idx]
+            chars_placed++
+          }
         }
       }
       # Fill rounding remainder with last used color/char
-      if (chars_placed < total_bar_len) {
-        bar = bar sprintf("\033[%sm", color_codes[last_cidx])
-        while (chars_placed < total_bar_len) { bar = bar bar_syms[char_idx]; chars_placed++ }
-        bar = bar "\033[0m"
+      while (chars_placed < total_bar_len) {
+        vis_color[chars_placed] = color_codes[last_cidx]
+        vis_char[chars_placed] = bar_syms[last_char_idx]
+        chars_placed++
       }
+      # Pad with blanks up to the furthest threshold so all lines render
+      if (furthest_line >= 0 && furthest_line >= chars_placed) {
+        while (chars_placed <= furthest_line) {
+          vis_color[chars_placed] = ""
+          vis_char[chars_placed] = " "
+          chars_placed++
+        }
+      }
+      # Overlay threshold lines (applied in ascending severity so red wins on overlap)
+      if (pro_pos   >= 0 && pro_pos   < chars_placed) { vis_color[pro_pos]   = "38;5;244"; vis_char[pro_pos]   = "│" }
+      if (max5_pos  >= 0 && max5_pos  < chars_placed) { vis_color[max5_pos]  = "33";        vis_char[max5_pos]  = "│" }
+      if (max20_pos >= 0 && max20_pos < chars_placed) { vis_color[max20_pos] = "31";        vis_char[max20_pos] = "│" }
+      # Render, minimising ANSI codes by only switching color on change
+      bar = ""
+      prev_color = ""
+      for (p = 0; p < chars_placed; p++) {
+        cur_color = vis_color[p]
+        if (cur_color != prev_color) {
+          if (prev_color != "") bar = bar "\033[0m"
+          if (cur_color != "") bar = bar sprintf("\033[%sm", cur_color)
+          prev_color = cur_color
+        }
+        bar = bar vis_char[p]
+      }
+      if (prev_color != "") bar = bar "\033[0m"
 
       # Day of week via Tomohiko Sakamoto algorithm (0=Sun..6=Sat)
       split(dates[i], dp, "-")
@@ -421,10 +485,18 @@ echo "$TSV_OUTPUT" | awk -F'\t' -v metric="$METRIC" -v term_width="$TERM_WIDTH" 
 
       tok_sum = 0; cost_sum = 0
       for (c = 1; c <= NC; c++) { key = i SUBSEP c; tok_sum += tok[key]; cost_sum += cst[key] }
+
+      # 7d-plan-equivalent: always derived from cost so the column is meaningful in both metrics.
+      pct = (daily_limit > 0) ? cost_sum / daily_limit * 100 : 0
+      pct_rounded = int(pct + 0.5)
+      pct_vis = sprintf("%5d%%", pct_rounded)
+      if (pct_rounded >= 100) pct_fmt = "\033[31m" pct_vis "\033[0m"
+      else pct_fmt = pct_vis
+
       if (is_weekend)
-        printf "  \033[2m%-16s %7.1fM %8.2f\033[0m  %s\n", date_str, tok_sum/1000000, cost_sum, bar
+        printf "  \033[2m%-16s %7.1fM %8.2f\033[0m %s  %s\n", date_str, tok_sum/1000000, cost_sum, pct_fmt, bar
       else
-        printf "  %-16s %7.1fM %8.2f  %s\n", date_str, tok_sum/1000000, cost_sum, bar
+        printf "  %-16s %7.1fM %8.2f %s  %s\n", date_str, tok_sum/1000000, cost_sum, pct_fmt, bar
     }
     grand_t = 0; grand_c = 0
     for (i = 1; i <= n; i++) {
