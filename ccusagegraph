@@ -28,6 +28,49 @@ date_add_one_day() { # $1=YYYYMMDD → YYYYMMDD+1
   else date -d "$1 + 1 day" +%Y%m%d; fi
 }
 
+# Daily ccusage version check. Reads cached "latest" from prior background
+# refresh and prints a note if installed differs. If cache is stale (>24h)
+# or absent, kicks off a detached background curl — never blocks main run.
+ccusage_version_check() {
+  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ccusagegraph"
+  local cache_file="$cache_dir/ccusage_latest"
+  local max_age=86400
+
+  local installed=""
+  installed=$(ccusage --version 2>/dev/null | head -n1 | tr -d '[:space:]')
+
+  if [[ -f "$cache_file" ]]; then
+    local latest
+    latest=$(tr -d '[:space:]' < "$cache_file" 2>/dev/null || true)
+    if [[ -n "$latest" && -n "$installed" && "$latest" != "$installed" ]]; then
+      printf '\n  \033[33mNote: ccusage %s available (installed: %s). Update: npm i -g ccusage@latest\033[0m\n' "$latest" "$installed" >&2
+    fi
+  fi
+
+  local need_refresh=true
+  if [[ -f "$cache_file" ]]; then
+    local mtime now
+    if $IS_DARWIN; then mtime=$(stat -f %m "$cache_file" 2>/dev/null || echo 0)
+    else mtime=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0); fi
+    now=$(date +%s)
+    (( now - mtime < max_age )) && need_refresh=false
+  fi
+
+  if $need_refresh; then
+    mkdir -p "$cache_dir" 2>/dev/null || return 0
+    (
+      latest=$(curl -fsSL --max-time 5 https://registry.npmjs.org/ccusage/latest 2>/dev/null \
+        | jq -r '.version // empty' 2>/dev/null)
+      if [[ -n "$latest" ]]; then
+        printf '%s\n' "$latest" > "$cache_file"
+      else
+        touch "$cache_file"
+      fi
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+}
+
 SINCE=""
 UNTIL=""
 DAYS=""
@@ -528,3 +571,5 @@ BEGIN {
   col += entry_len
 }
 END { printf "\n\n" }'
+
+ccusage_version_check
