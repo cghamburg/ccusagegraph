@@ -6,12 +6,8 @@ VERSION="0.1"
 # Require Bash 4+ for associative arrays
 (( BASH_VERSINFO[0] >= 4 )) || { echo "Error: Bash 4+ required (found ${BASH_VERSION})" >&2; exit 1; }
 
-# Allow overriding the ccusage binary (e.g. a faster patched build).
-# Set CCUSAGE_BIN to an absolute path; defaults to whatever's on PATH.
-CCUSAGE_BIN="${CCUSAGE_BIN:-ccusage}"
-
 # Check required tools
-command -v "$CCUSAGE_BIN" >/dev/null 2>&1 || [[ -x "$CCUSAGE_BIN" ]] || { echo "Error: ccusage not found at '$CCUSAGE_BIN'. Install from https://github.com/ryoppippi/ccusage or set CCUSAGE_BIN." >&2; exit 1; }
+command -v ccusage >/dev/null 2>&1 || { echo "Error: ccusage not found on PATH. Install from https://github.com/ryoppippi/ccusage." >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "Error: jq not found. Install from https://jqlang.github.io/jq/" >&2; exit 1; }
 
 # Platform detection (cached)
@@ -41,7 +37,7 @@ ccusage_version_check() {
   local max_age=86400
 
   local installed=""
-  installed=$("$CCUSAGE_BIN" --version 2>/dev/null | head -n1 | tr -d '[:space:]')
+  installed=$(ccusage --version 2>/dev/null | head -n1 | awk '{print $NF}')
 
   if [[ -f "$cache_file" ]]; then
     local latest
@@ -169,10 +165,10 @@ elif [[ -z "$SINCE" ]]; then
   SINCE=$(date_subtract_days 28)
 fi
 
-CCUSAGE_ARGS=(daily --since "$SINCE" --instances --json)
+CCUSAGE_ARGS=(claude daily --since "$SINCE" --instances --json)
 [[ -n "$UNTIL" ]] && CCUSAGE_ARGS+=(--until "$UNTIL")
 
-if ! JSON=$("$CCUSAGE_BIN" "${CCUSAGE_ARGS[@]}" 2>&1); then
+if ! JSON=$(ccusage "${CCUSAGE_ARGS[@]}" 2>&1); then
   echo "Error: ccusage failed: $JSON" >&2
   exit 1
 fi
